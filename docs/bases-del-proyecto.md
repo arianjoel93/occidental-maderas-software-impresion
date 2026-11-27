@@ -27,10 +27,22 @@ En **Configuración → Siguiente folio** se puede ajustar el número hacia arri
 
 ### Etiqueta de Occidental Maderas
 
-El catálogo del cliente se reconoce por los encabezados Clase, Espesor, Ancho, Largo y Piezas. Sin un SKU de origen, se genera uno a partir de la clase y las tres medidas, para que una reimportación actualice las piezas de la misma combinación. Si el archivo carece de pedimento, la importación por adición conserva los pedimentos capturados. Se pueden introducir en Editar producto o incluir en una columna opcional `No. Pedimento`.
+El catálogo del cliente se reconoce por los encabezados Clase, Espesor, Ancho, Largo y Piezas. Sin un SKU de origen, se genera uno a partir de la clase y las tres medidas, para que una reimportación actualice las piezas de la misma combinación. El pedimento se captura en **Preparar impresión**. **Aplicar pedimento** llena las filas del lote y después se puede editar cada fila. Todas las copias de un producto usan el valor de su fila. La app ignora la columna de pedimento al importar y cada trabajo comienza con los campos de pedimento vacíos.
 
-El primer catálogo compatible instala el diseño **Occidental Maderas · Etiqueta con QR**. El tamaño original es 831 × 609 puntos. La fecha de entrada se toma del reloj local al generar el lote y el folio avanza en cada etiqueta. Para integrarse con otra aplicación, el lector debe entregar el texto del QR a un parser JSON UTF-8. La versión `v: 1` incluye `sku`, `clase`, `espesor`, `ancho`, `largo`, `medidas`, `piezas`, `pedimento`, `folio` entero y `fecha_entrada` en ISO 8601 con zona horaria. Las cantidades y medidas del catálogo se transmiten como texto para respetar las fracciones y unidades.
+El primer catálogo compatible instala el diseño **Occidental Maderas · Etiqueta con QR**. El tamaño original es 831 × 609 puntos. La fecha de entrada se toma del reloj local al generar el lote y se imprime con formato `DD/MM/AAAA`. El folio avanza en cada etiqueta.
 
-La aplicación genera un formato por etiqueta, incluidas las copias, con un folio propio. Un trabajo admite hasta 500 etiquetas y 8 MB de comandos. SQLite reserva el rango en una transacción antes de enviar los datos a Windows. Si Windows o la impresora interrumpen el trabajo, puede quedar un salto en el consecutivo. Se conserva la reserva para evitar duplicar una etiqueta que pudo haberse impreso. El número de trabajo indica que Windows recibió los datos. La salida física se verifica en el equipo.
+El QR contiene cinco valores separados por cuatro tabulaciones ASCII, en este orden: Producto (medidas), Fecha de entrada (`DD/MM/AAAA`), Descripción (clase), No. Pedimento y Piezas (cantidad). Si falta el pedimento, el QR conserva las dos tabulaciones consecutivas que corresponden a ese campo vacío. El QR termina en Piezas. Para capturar desde un lector en modo teclado, sitúa el cursor en Producto, ajusta el lector para que emita el carácter de tabulación como la tecla Tab y desactiva su sufijo automático si agrega Enter o Tab. El orden de foco del formulario y su formato de fecha deben coincidir con el contenido del QR.
+
+Cada fila del lote recibe un folio. Si se solicitan dos copias, se envían dos etiquetas idénticas con el mismo folio. Un trabajo admite hasta 500 impresiones y 8 MB de comandos. SQLite reserva el rango y guarda la etiqueta original antes de enviarla a Windows. Si se interrumpe el envío, revisa la cola antes de reimprimir. El estado Enviado indica que Windows recibió el trabajo.
+
+En **Historial** se puede buscar por folio, fecha de impresión, producto o QR. El QR puede coincidir con varios folios, ya que contiene datos de producto y carece de folio. Elige el registro correcto antes de reimprimir. La reimpresión envía una copia del comando original, con su folio y fecha, y registra un intento nuevo sin avanzar el consecutivo. El historial empieza con los trabajos generados por la versión 1.0.3.
 
 El catálogo y el consecutivo pertenecen a la base local del perfil de Windows. La unicidad entre varias computadoras requiere una fuente de folios compartida.
+
+## Flujo de impresión en escritorio
+
+El **Catálogo** muestra los botones para imprimir y borrar junto al total de productos seleccionados. El botón de importación está en el encabezado y el menú de acciones incluye la descarga de la plantilla. La paginación queda debajo de la tabla.
+
+En **Preparar impresión**, la impresora y el diseño guardados aparecen como datos de consulta. Los ajustes generales de copias y pedimento preceden a la tabla, donde se pueden editar por producto. El pie muestra el número de productos y etiquetas, con los botones **Cancelar** e **Imprimir**. La vista previa ZPL aparece en una fila propia.
+
+En **Historial**, la acción **Reimprimir** abre una confirmación con el folio, el producto y el pedimento recuperado del QR registrado, cuando está disponible. El operador elige la impresora antes de confirmar.

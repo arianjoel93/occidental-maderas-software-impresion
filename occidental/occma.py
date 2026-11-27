@@ -21,7 +21,7 @@ ZPL = """^XA
 ^PW831
 ^LL609
 ^LS0
-^FO489,172^BQN,2,4^FH^FDMA,{{qr_occma}}^FS
+^FO420,155^BQN,2,9^FH^FDMA,{{qr_occma}}^FS
 ^FT0,257^A0N,36,35^FB423,2,9,C,0^FH^FD{{clase}}^FS
 ^FT0,102^A0N,68,68^FB831,1,0,C,0^FH^FD{{medidas}}^FS
 ^FT0,409^A0N,70,68^FB355,1,0,C,0^FH^FD{{piezas_texto}}^FS
@@ -29,6 +29,15 @@ ZPL = """^XA
 ^FT291,567^A0N,37,35^FB249,1,0,C,0^FH^FD{{folio}}^FS
 ^FT60,527^A0N,28,28^FDFecha de entrada^FS
 ^FT49,567^A0N,25,22^FH^FD{{fecha_entrada}}^FS
-^FT564,527^A0N,28,28^FDNo. Pedimento^FS
-^FT553,567^A0N,25,22^FH^FD{{pedimento}}^FS
+^FT564,544^A0N,28,28^FDNo. Pedimento^FS
+^FT553,581^A0N,25,22^FH^FD{{pedimento}}^FS
 ^XZ"""
+
+PREVIOUS_ZPL = ZPL.replace('^FO420,155^BQN,2,9', '^FO420,130^BQN,2,9')
+INITIAL_LARGE_ZPL = PREVIOUS_ZPL.replace('^FO420,130^BQN,2,9', '^FO420,105^BQN,2,9')
+PREVIOUS_ZPLS = (PREVIOUS_ZPL, INITIAL_LARGE_ZPL) + tuple(
+    INITIAL_LARGE_ZPL.replace('^FO420,105^BQN,2,9', command).replace('^FT564,544', '^FT564,527')
+       .replace('^FT553,581', '^FT553,567')
+    for command in (
+        '^FO489,172^BQN,2,4', '^FO466,147^BQN,2,6', '^FO430,122^BQN,2,7',
+))

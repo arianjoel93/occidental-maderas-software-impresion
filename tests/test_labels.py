@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import re
 import sqlite3
@@ -18,10 +18,11 @@ from occidental.occma import DESIGN_NAME, ZPL
 
 class LabelsTest(unittest.TestCase):
     def test_occma_catalog_identity_and_qr(self):
-        headers = ('CLASE', 'ESPESOR ', 'ANCHO', 'LARGO', 'PIEZAS')
+        headers = ('CLASE', 'ESPESOR ', 'ANCHO', 'LARGO', 'PIEZAS', 'No. Pedimento')
         product = ('Primera  nacional', '3/4"', '6"', "8'")
-        initial = parse_rows([headers, (*product, 280)])
-        updated = parse_rows([headers, (*product, 399)])
+        initial = parse_rows([headers, (*product, 280, 'IGNORADO')])
+        updated = parse_rows([headers, (*product, 399, 'IGNORADO')])
+        self.assertNotIn('pedimento', initial.fields)
         sku = initial.items[0].sku
         self.assertEqual(sku, updated.items[0].sku)
         with TemporaryDirectory() as directory:
@@ -30,19 +31,23 @@ class LabelsTest(unittest.TestCase):
             self.assertEqual(store.setting('design'), DESIGN_NAME)
             item = store.products()[0]
             self.assertEqual(missing_fields(ZPL, [item]), {sku: ['pedimento']})
-            store.update_product(sku, sku, item.name, item.description, attributes={'pedimento': 'G-123'})
             store.import_products(updated.items, fields=updated.fields)
             item, = store.products()
+            item = replace(item, attributes={**item.attributes, 'pedimento': 'G-123'})
             stamp = datetime(2026, 11, 26, 8, 29, 27, tzinfo=timezone.utc)
             output = render(ZPL, 'ZPL', item, 77, timestamp=stamp)
             hex_data = re.search(rb'\^FDMA,([^\^]+)', output).group(1).replace(b'_', b'')
-            payload = json.loads(bytes.fromhex(hex_data.decode('ascii')))
-            self.assertEqual(payload, {
-                'v': 1, 'sku': sku, 'clase': product[0], 'espesor': product[1],
-                'ancho': product[2], 'largo': product[3], 'medidas': '3/4 x 6" x 8\'',
-                'piezas': '399', 'pedimento': 'G-123', 'folio': 77,
-                'fecha_entrada': '2026-11-26T08:29:27+00:00',
-            })
+            payload = bytes.fromhex(hex_data.decode('ascii')).decode('utf-8')
+            self.assertEqual(payload, '3/4 x 6" x 8\'\t26/11/2026\tPrimera nacional\tG-123\t399')
+            hex_fields = re.findall(rb'\^FH\^FD((?:_[0-9A-F]{2})+)\^FS', output)
+            text_fields = [bytes.fromhex(value.replace(b'_', b'').decode('ascii')).decode('utf-8')
+                           for value in hex_fields]
+            self.assertIn('26/11/2026', text_fields)
+
+            blank = render(ZPL, 'ZPL', initial.items[0], 78, timestamp=stamp)
+            hex_data = re.search(rb'\^FDMA,([^\^]+)', blank).group(1).replace(b'_', b'')
+            payload = bytes.fromhex(hex_data.decode('ascii')).decode('utf-8')
+            self.assertEqual(payload.split('\t'), ['3/4 x 6" x 8\'', '26/11/2026', 'Primera nacional', '', '280'])
 
     def test_excel_csv_and_atomic_catalog_updates(self):
         with TemporaryDirectory() as directory:
@@ -114,9 +119,37 @@ class LabelsTest(unittest.TestCase):
                 db.prepare_print_batch([(first, 0), (second, 2)], design)
             self.assertEqual(db.next_folio(), 1)
             start, end, payload = db.prepare_print_batch([(first, 3), (second, 2)], design)
-            self.assertEqual((start, end, db.next_folio()), (1, 5, 6))
+            self.assertEqual((start, end, db.next_folio()), (1, 2, 3))
             self.assertEqual(payload.count(b'^FD_41^FS'), 3)
             self.assertEqual(payload.count(b'^FD_42^FS'), 2)
+            self.assertEqual(payload.count(b'^FD_31^FS'), 3)
+            self.assertEqual(payload.count(b'^FD_32^FS'), 2)
+
+    def test_history_search_and_exact_reprint(self):
+        with TemporaryDirectory() as directory:
+            db = LabelStore(Path(directory) / 'labels.sqlite3')
+            item = Item('H-01', 'Píno', 'Primera', {
+                'espesor': '1', 'ancho': '4', 'largo': '8', 'piezas': '50', 'pedimento': 'A-2',
+            })
+            start, end, payload, job = db.prepare_print_batch([(item, 2)], (DESIGN_NAME, 'ZPL', ZPL), printer='USB')
+            self.assertEqual((start, end, db.next_folio()), (1, 1, 2))
+            pending, = db.print_history('1', mode='folio')
+            self.assertEqual(pending.status, 'pending')
+            db.finish_print(job, 90)
+            original, = db.print_history('pino', mode='product')
+            self.assertEqual((original.copies, original.status), (2, 'sent'))
+            date = datetime.fromisoformat(original.printed_at).strftime('%d/%m/%Y')
+            self.assertEqual(db.print_history(date), [original])
+            raw = re.search(rb'\^FDMA,([^\^]+)', payload)[1].replace(b'_', b'')
+            scanned = bytes.fromhex(raw.decode()).decode()
+            self.assertEqual(db.print_history(scanned, mode='qr'), [original])
+            retry, label = db.prepare_reprint(original.id, 'USB')
+            self.assertEqual(label * 2, payload)
+            db.finish_print(retry)
+            reprint, original_again = db.print_history(scanned, mode='qr')
+            self.assertEqual(original_again, original)
+            self.assertEqual((reprint.folio, reprint.reprint, reprint.copies, reprint.status), ('1', 1, 1, 'uncertain'))
+            self.assertEqual(db.next_folio(), 2)
 
     def test_stale_import_preview_does_not_replace_products(self):
         with TemporaryDirectory() as directory:
@@ -179,13 +212,13 @@ class LabelsTest(unittest.TestCase):
                 return start, end
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                self.assertEqual(sorted(pool.map(reserve, range(2))), [(1, 2), (3, 4)])
-            self.assertEqual(LabelStore(db.path).next_folio(), 5)
+                self.assertEqual(sorted(pool.map(reserve, range(2))), [(1, 1), (2, 2)])
+            self.assertEqual(LabelStore(db.path).next_folio(), 3)
             db.save_settings('USB', design[0], 10)
             self.assertEqual(db.prepare_print([Item('A', 'Pino', '')], 1, design)[:2], (10, 10))
             db.save_settings('USB', design[0], 1)
             self.assertEqual(LabelStore(db.path).next_folio(), 1)
-            self.assertEqual(db.prepare_print([Item('A', 'Pino', '')], 2, design)[:2], (1, 2))
-            self.assertEqual(db.next_folio(), 3)
+            self.assertEqual(db.prepare_print([Item('A', 'Pino', '')], 2, design)[:2], (1, 1))
+            self.assertEqual(db.next_folio(), 2)
             with self.assertRaisesRegex(ValueError, 'positivo'):
                 db.save_settings('USB', design[0], 0)

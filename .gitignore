@@ -4,6 +4,7 @@
 .flet-build-tools/
 .flet-cache/
 dist-flet/
+dist-installer/
 __pycache__/
 build/
 dist-desktop/

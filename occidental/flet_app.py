@@ -1,12 +1,19 @@
 import asyncio
+from dataclasses import replace
+from datetime import datetime
+import shutil
 import os
 from pathlib import Path
 import sqlite3
 
 import flet as ft
 
+from occidental.help_content import (
+    GUIDE, MANUAL_FILE, PUBLISHER, SUPPORT_EMAIL, SUPPORT_PHONE, TROUBLESHOOTING, VERSION, WHATSAPP_URL,
+)
+
 from occidental.labels import (
-    BUILTIN_FIELDS, LABEL_FIELDS, LIMIT, LabelStore, design_fields, item_values, key,
+    BUILTIN_FIELDS, LABEL_FIELDS, LIMIT, PEDIMENTO_COLUMNS, LabelStore, design_fields, item_values, key, label_values,
     missing_fields, read_catalog_file, render, write_catalog_example,
 )
 from occidental.labelary import label_size, preview_png
@@ -14,6 +21,8 @@ from occidental.occma import FIELDS as OCCMA_FIELDS
 from occidental.printers import default_printer, list_printers, printer_port, submit
 
 
+APP_NAME = 'Control de impresión Accidental Maderas y Derivados'
+RESOURCES = Path(__file__).resolve().with_name('resources')
 INK = '#22272B'
 MUTED = '#586169'
 LINE = '#CDD3D9'
@@ -50,10 +59,10 @@ def surface(content, *, expand=False, padding=18):
     )
 
 
-def action(text, callback, icon=None, *, primary=False, disabled=False, height=40, danger=False):
+def action(text, callback, icon=None, *, primary=False, disabled=False, height=40, width=None, danger=False):
     control = ft.FilledButton if primary or danger else ft.OutlinedButton
     return control(content=text, icon=icon, on_click=callback, disabled=disabled,
-                   height=height, style=ft.ButtonStyle(
+                   height=height, width=width, style=ft.ButtonStyle(
                        shape=ft.RoundedRectangleBorder(radius=8),
                        bgcolor=DANGER if danger else None, color=PAPER if danger else None,
                    ))
@@ -148,10 +157,10 @@ def option(value):
 
 
 class LabelApp:
-    def __init__(self, page, store):
+    def __init__(self, page, store, products=None):
         self.page = page
         self.store = store
-        self.products = store.products()
+        self.products = store.products() if products is None else products
         self.selected = set()
         self.search = ''
         self.search_field = ''
@@ -161,14 +170,15 @@ class LabelApp:
         self.windows_printers = []
         self.windows_default = None
         self.picker = ft.FilePicker()
-        self.page.services.append(self.picker)
+        self.launcher = ft.UrlLauncher()
+        self.clipboard = ft.Clipboard()
+        self.page.services.extend([self.picker, self.launcher, self.clipboard])
         self.toast = ft.Container(
             visible=False, top=112, right=24, width=390, border_radius=12,
             padding=ft.Padding.symmetric(horizontal=14, vertical=10),
             shadow=ft.BoxShadow(color='#28171717', blur_radius=20, offset=ft.Offset(0, 5)),
         )
         self.page.overlay.append(self.toast)
-        self.page.title = 'Occidental Maderas — Impresión de etiquetas'
         self.page.theme = ft.Theme(
             font_family='Segoe UI', color_scheme_seed=INK,
             color_scheme=ft.ColorScheme(
@@ -184,10 +194,6 @@ class LabelApp:
         self.page.bgcolor = WORKSPACE
         self.page.padding = 0
         self.page.spacing = 0
-        self.page.window.min_width = 880
-        self.page.window.min_height = 620
-        self.page.window.width = 1200
-        self.page.window.height = 760
         self.content = ft.Column(expand=True, spacing=16, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
         self.menu = ft.Row(spacing=14)
         self.toolbar = ft.Row(spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
@@ -235,7 +241,7 @@ class LabelApp:
     def close(self):
         self.page.pop_dialog()
 
-    def dialog(self, heading, content, actions, *, max_height=None):
+    def dialog(self, heading, content, actions, *, max_height=None, footer_gap=0):
         vertical_inset = max(24, ((self.page.height or 0) - max_height) / 2) if max_height else 24
         symbol = next((icon for prefix, icon in (
             ('Borrar', ft.Icons.DELETE_OUTLINE), ('Editar', ft.Icons.EDIT_OUTLINED),
@@ -255,7 +261,7 @@ class LabelApp:
             scrollable=True, inset_padding=ft.Padding.symmetric(horizontal=40, vertical=vertical_inset),
             title_padding=0, clip_behavior=ft.ClipBehavior.ANTI_ALIAS, barrier_color='#660F1720',
             content_padding=ft.Padding.symmetric(horizontal=20, vertical=16),
-            actions_padding=ft.Padding.only(left=16, right=16, bottom=16),
+            actions_padding=ft.Padding.only(left=16, top=footer_gap, right=16, bottom=16),
             shape=ft.RoundedRectangleBorder(radius=12),
             actions=actions, actions_alignment=ft.MainAxisAlignment.END, actions_overflow_button_spacing=8,
         )
@@ -264,7 +270,8 @@ class LabelApp:
 
     def navigate(self, tab):
         self.active_tab = tab
-        {'Catálogo': self.catalog, 'Diseños': self.designs, 'Configuración': self.settings}[tab]()
+        {'Catálogo': self.catalog, 'Diseños': self.designs, 'Historial': self.history,
+         'Configuración': self.settings, 'Ayuda': self.help_page}[tab]()
         self.draw_navigation()
         self.page.update()
         if tab == 'Configuración':
@@ -285,9 +292,14 @@ class LabelApp:
         areas = (
             ('Catálogo', ft.Icons.LAYERS_OUTLINED),
             ('Diseños', ft.Icons.LOCAL_OFFER_OUTLINED),
+            ('Historial', ft.Icons.HISTORY),
             ('Configuración', ft.Icons.SETTINGS_OUTLINED),
+            ('Ayuda', ft.Icons.HELP_OUTLINE),
         )
         self.menu.controls = [
+            ft.Row([title('OM', 24), ft.VerticalDivider(width=12, color=LINE),
+                    title('Occidental Maderas', 14)], spacing=4, height=38),
+        ] + [
             ft.TextButton(content=area, icon=icon, height=40,
                           style=ft.ButtonStyle(color=INK, bgcolor=TAB_ACTIVE if area == self.active_tab else None,
                                                shape=ft.RoundedRectangleBorder(radius=7)),
@@ -307,17 +319,13 @@ class LabelApp:
 
         if self.active_tab == 'Catálogo':
             self.toolbar.controls = [
-                action('Imprimir lote', self.print_selected, ft.Icons.PRINT_OUTLINED,
-                       primary=True, disabled=not selected),
-                rule(),
-                command('Actualizar', ft.Icons.REFRESH, lambda _: self.refresh_products()),
-                rule(),
-                command('Editar', ft.Icons.EDIT_OUTLINED, lambda _: self.edit_product(single), disabled=single is None),
-                command('Duplicar', ft.Icons.CONTENT_COPY_OUTLINED,
-                        lambda _: self.edit_product(single, duplicate=True), disabled=single is None),
-                command('Eliminar', ft.Icons.DELETE_OUTLINE, self.confirm_delete_selected, disabled=not selected),
-                rule(),
                 ft.PopupMenuButton(icon=ft.Icons.MORE_HORIZ, tooltip='Más acciones del catálogo', items=[
+                    ft.PopupMenuItem(content='Actualizar', icon=ft.Icons.REFRESH,
+                                     on_click=lambda _: self.refresh_products()),
+                    ft.PopupMenuItem(content='Editar', icon=ft.Icons.EDIT_OUTLINED,
+                                     disabled=single is None, on_click=lambda _: self.edit_product(single)),
+                    ft.PopupMenuItem(content='Duplicar', icon=ft.Icons.CONTENT_COPY_OUTLINED,
+                                     disabled=single is None, on_click=lambda _: self.edit_product(single, duplicate=True)),
                     ft.PopupMenuItem(content='Importar Excel o CSV', icon=ft.Icons.UPLOAD_FILE_OUTLINED,
                                      on_click=self.import_catalog),
                     ft.PopupMenuItem(content='Descargar plantilla', icon=ft.Icons.DOWNLOAD_OUTLINED,
@@ -336,7 +344,10 @@ class LabelApp:
             ]
         else:
             self.toolbar.controls = []
-        self.toolbar_band.visible = bool(self.toolbar.controls)
+        self.toolbar_band.visible = bool(self.toolbar.controls) and self.active_tab != 'Catálogo'
+        if self.active_tab == 'Catálogo':
+            self.catalog_commands.controls = list(self.toolbar.controls)
+            self.toolbar.controls = []
 
     def catalog(self):
         self.fields = self.store.catalog_fields()
@@ -348,7 +359,7 @@ class LabelApp:
         if self.occma_catalog:
             catalog_fields = {**OCCMA_FIELDS, **self.fields}
             catalog_fields = {field: label for field, label in catalog_fields.items()
-                              if field in OCCMA_FIELDS or field == 'pedimento' or
+                              if field in OCCMA_FIELDS or
                               any(field in item.attributes for item in self.products)}
         self.column_labels = ({'descripcion': 'Clase'} if self.occma_catalog else
                               {'nombre': 'Nombre', 'descripcion': 'Descripción'}) | catalog_fields
@@ -357,7 +368,7 @@ class LabelApp:
         if self.search_field not in search_fields:
             self.search_field = ''
         self.search_box = ft.TextField(
-            value=self.search, hint_text='Buscar clase, medida o pedimento…' if self.occma_catalog else
+            value=self.search, hint_text='Buscar clase o medida…' if self.occma_catalog else
             'Buscar producto, SKU o descripción…', expand=True,
             prefix_icon=ft.Icons.SEARCH, **compact_field_style(),
             on_change=self.filter_catalog,
@@ -375,6 +386,10 @@ class LabelApp:
 
         field_filter.on_select = change_filter
         self.catalog_rows = ft.Column(expand=True, spacing=0, scroll=ft.ScrollMode.AUTO)
+        self.catalog_commands = ft.Row(tight=True)
+        self.selection_count = title('', 14)
+        self.batch_print = action('Imprimir lote', self.print_selected, ft.Icons.PRINT_OUTLINED, primary=True)
+        self.batch_delete = action('Borrar seleccionados', self.confirm_delete_selected, ft.Icons.DELETE_OUTLINE)
         self.pagination = ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
         self.page_checkbox = checkbox(tooltip='Seleccionar página', on_change=self.toggle_page_selection)
         header = self.product_row(self.page_checkbox, title('SKU', 13), title('Producto', 13),
@@ -389,11 +404,19 @@ class LabelApp:
             self.wide_table = None
             table = self.catalog_grid
         self.content.controls = [
-            title('Catálogo de productos', 30),
+            ft.Row([ft.Container(title('Catálogo de productos', 30), expand=True),
+                    action('Importar Excel o CSV', self.import_catalog, ft.Icons.UPLOAD_FILE_OUTLINED),
+                    self.catalog_commands],
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Row([self.search_box, ft.Text('Buscar en:'), field_filter,
                     action('Columnas', self.choose_columns, ft.Icons.VIEW_COLUMN_OUTLINED,
                            height=COMPACT_HEIGHT)],
                    spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Container(
+                ft.Row([self.selection_count, self.batch_print, self.batch_delete],
+                       spacing=14, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                bgcolor=SOFT, border_radius=7, padding=ft.Padding.symmetric(horizontal=12, vertical=5),
+            ),
             ft.Container(
                 ft.Column([table], horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                           scroll=ft.ScrollMode.AUTO),
@@ -423,7 +446,7 @@ class LabelApp:
             ft.Text('Elige las columnas que quieres mostrar.', color=MUTED),
             *choices.values(),
         ]), width=380), [
-            ft.TextButton(content='Cancelar', on_click=lambda _: self.close()),
+            action('Cancelar', lambda _: self.close()),
             action('Aplicar', save, primary=True),
         ], max_height=520)
 
@@ -464,7 +487,8 @@ class LabelApp:
         term = key(self.search)
         def matches(item):
             values = item_values(item)
-            return term in key(values.get(self.search_field, '') if self.search_field else ' '.join(values.values()))
+            searchable = (value for field, value in values.items() if field not in PEDIMENTO_COLUMNS)
+            return term in key(values.get(self.search_field, '') if self.search_field else ' '.join(searchable))
 
         shown = [item for item in self.products if matches(item)]
         last_page = max(0, (len(shown) - 1) // PAGE_SIZE)
@@ -495,8 +519,9 @@ class LabelApp:
                                  color=MUTED), padding=22)
         ]
         summary = f'{start + 1}–{start + len(visible)} de {len(shown)}' if visible else '0 productos'
-        if self.selected:
-            summary += f' · {len(self.selected)} seleccionados'
+        count = len(self.selected)
+        self.selection_count.value = '1 producto seleccionado' if count == 1 else f'{count} productos seleccionados'
+        self.batch_print.disabled = self.batch_delete.disabled = not count
         self.pagination.controls = [
             ft.Text(summary, color=MUTED),
             ft.Row([
@@ -582,7 +607,7 @@ class LabelApp:
                     horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 ), expand=True, padding=ft.Padding.symmetric(horizontal=20, vertical=12)),
                 ft.Container(ft.Row([
-                    ft.TextButton(content='Cancelar', on_click=lambda _: self.close()),
+                    action('Cancelar', lambda _: self.close()),
                     action('Guardar cambios', save, ft.Icons.SAVE_OUTLINED, primary=True),
                 ], alignment=ft.MainAxisAlignment.END, wrap=True),
                     padding=ft.Padding.symmetric(horizontal=16, vertical=12),
@@ -620,7 +645,7 @@ class LabelApp:
             self.refresh_products()
             self.notice(f'Se eliminaron {count} productos del catálogo.', heading='Lote eliminado')
 
-        cancel = ft.TextButton(content='Cancelar', on_click=lambda _: self.close())
+        cancel = action('Cancelar', lambda _: self.close())
         confirm = action('Borrar seleccionados', delete, ft.Icons.DELETE_OUTLINE, danger=True)
         self.dialog('Borrar productos seleccionados', ft.Container(form_column([
             ft.Text(f'¿Quieres borrar {len(skus)} productos del catálogo?'),
@@ -648,7 +673,7 @@ class LabelApp:
             ft.Text(item.name), ft.Row([badge(item.sku, code=True)]),
             message_strip('El producto se eliminará del catálogo.', 'error'), problem,
         ]), width=440), [
-            ft.TextButton(content='Cancelar', on_click=lambda _: self.close()),
+            action('Cancelar', lambda _: self.close()),
             action('Borrar producto', delete, ft.Icons.DELETE_OUTLINE, danger=True),
         ])
 
@@ -790,7 +815,7 @@ class LabelApp:
                 ], spacing=10),
                 ft.Row([previous, position, forward], alignment=ft.MainAxisAlignment.END), rows,
             ]), width=680), [
-                ft.TextButton(content='Cancelar', on_click=lambda _: self.close()),
+                action('Cancelar', lambda _: self.close()),
                 apply_button,
             ], max_height=650)
             draw()
@@ -807,7 +832,7 @@ class LabelApp:
                                padding=9, bgcolor=WORKSPACE, border_radius=6)
                   for field, label in new_fields.items()],
             ]), width=500), [
-                ft.TextButton(content='Cancelar importación', on_click=lambda _: self.close()),
+                action('Cancelar importación', lambda _: self.close()),
                 action('Incluir variables', accept_fields, primary=True),
             ], max_height=520)
         else:
@@ -889,7 +914,7 @@ class LabelApp:
                                                    height=FIELD_HEIGHT)], spacing=12))
         fields = [name, language_row, field, title('Variables', 13),
                   ft.Row([badge('{{' + field + '}}', code=True) for field in available], wrap=True), error]
-        buttons = [ft.TextButton(content='Cerrar' if view else 'Cancelar', on_click=lambda _: self.close())]
+        buttons = [action('Cerrar' if view else 'Cancelar', lambda _: self.close())]
         if not view:
             buttons.append(action('Guardar diseño', save, primary=True))
         self.dialog('Ver diseño' if view else ('Editar diseño' if record else 'Nuevo diseño'),
@@ -909,7 +934,7 @@ class LabelApp:
             ft.Text(f'¿Quieres eliminar «{name}»?'),
             message_strip('Esta acción no se puede deshacer.', 'error'),
         ]), width=430), [
-            ft.TextButton(content='Cancelar', on_click=lambda _: self.close()),
+            action('Cancelar', lambda _: self.close()),
             action('Borrar diseño', delete, danger=True),
         ])
 
@@ -1013,45 +1038,341 @@ class LabelApp:
                       expand=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER, scroll=ft.ScrollMode.AUTO),
         ]
 
+    def help_page(self):
+        async def open_link(url):
+            try:
+                await self.launcher.launch_url(url)
+            except Exception:
+                self.notice('Usa el número o el correo que aparece en Soporte técnico.',
+                            kind='error', heading='No se pudo abrir el enlace')
+
+        async def save_manual(_):
+            try:
+                path = await self.picker.save_file(file_name=MANUAL_FILE,
+                                                  file_type=ft.FilePickerFileType.CUSTOM,
+                                                  allowed_extensions=['pdf'])
+                if path:
+                    destination = Path(path)
+                    if destination.suffix.lower() != '.pdf':
+                        destination = destination.with_suffix('.pdf')
+                    await asyncio.to_thread(shutil.copyfile, RESOURCES / MANUAL_FILE, destination)
+                    self.notice('Manual guardado en PDF.')
+            except Exception as error:
+                self.notice(str(error), kind='error', heading='No se pudo guardar el manual')
+
+        async def copy_support(_):
+            printer = self.store.setting('printer') or 'Sin configurar'
+            design = self.store.setting('design') or 'Sin configurar'
+            await self.clipboard.set(f'{APP_NAME}\nVersión {VERSION}\nImpresora: {printer}\nDiseño: {design}')
+            self.notice('Datos de soporte copiados.')
+
+        logo = (RESOURCES / 'tectronic.png').read_bytes()
+
+        def logo_tile(size):
+            return ft.Container(
+                ft.Image(src=logo, width=size - 14, height=size - 14,
+                         fit=ft.BoxFit.CONTAIN, semantics_label='Logo de Tectronic'),
+                width=size, height=size, bgcolor=PAPER, border_radius=14, alignment=ft.Alignment.CENTER,
+                border=ft.Border.all(1, LINE),
+            )
+
+        def panel(heading, points, icon):
+            shape = ft.RoundedRectangleBorder(radius=12, side=ft.BorderSide(1, LINE))
+            return ft.ExpansionTile(
+                title=ft.Text(heading, size=15, weight=ft.FontWeight.W_600),
+                leading=ft.Container(ft.Icon(icon, size=18, color=ACCENT), width=36, height=36,
+                                     bgcolor=SELECTED, border_radius=9, alignment=ft.Alignment.CENTER),
+                controls=[ft.Container(form_column(points, spacing=10),
+                                       padding=ft.Padding.only(left=18, top=12, right=18, bottom=16),
+                                       border=ft.Border.only(top=ft.BorderSide(1, LINE)), bgcolor=PAPER)],
+                expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
+                tile_padding=ft.Padding.symmetric(horizontal=14), min_tile_height=60,
+                shape=shape, collapsed_shape=shape, bgcolor=SELECTED, collapsed_bgcolor=PAPER,
+                text_color=INK, collapsed_text_color=INK, icon_color=ACCENT, collapsed_icon_color=MUTED,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            )
+
+        guide_icons = (ft.Icons.SETTINGS_OUTLINED, ft.Icons.INVENTORY_2_OUTLINED,
+                       ft.Icons.PRINT_OUTLINED, ft.Icons.HISTORY)
+        guide = form_column([
+            title('Guía rápida', 21),
+            *[panel(heading, [ft.Text(f'{index}. {step}', selectable=True, size=14)
+                              for index, step in enumerate(steps, 1)], icon)
+              for (heading, steps), icon in zip(GUIDE, guide_icons)],
+        ], spacing=10)
+        problems = form_column([
+            title('Solución de problemas', 21),
+            *[panel(heading, [ft.Text(detail, selectable=True, size=14)], ft.Icons.BUILD_OUTLINED)
+              for heading, detail in TROUBLESHOOTING],
+        ], spacing=10)
+        support = surface(form_column([
+            ft.Row([logo_tile(58),
+                    ft.Column([title('Soporte técnico', 21), ft.Text(PUBLISHER, color=MUTED)],
+                              spacing=3, expand=True)], spacing=14),
+            ft.Text(f'{SUPPORT_PHONE}  ·  {SUPPORT_EMAIL}', selectable=True),
+            ft.Row([
+                action('Abrir WhatsApp', lambda _: self.page.run_task(open_link, WHATSAPP_URL),
+                       ft.Icons.CHAT_OUTLINED, primary=True),
+                action('Enviar correo', lambda _: self.page.run_task(open_link, f'mailto:{SUPPORT_EMAIL}'),
+                       ft.Icons.MAIL_OUTLINE),
+                action('Copiar datos de soporte', copy_support, ft.Icons.CONTENT_COPY_OUTLINED),
+            ], wrap=True),
+        ]))
+        about = form_column([
+            ft.Container(ft.Row([
+                logo_tile(86),
+                ft.Column([
+                    ft.Text(PUBLISHER, color=ACCENT, weight=ft.FontWeight.W_600, size=14),
+                    title(APP_NAME, 25),
+                    ft.Row([badge(f'Versión {VERSION}'), badge('Windows')], wrap=True),
+                ], spacing=8, expand=True),
+            ], spacing=20), bgcolor=SELECTED, padding=24, border_radius=16,
+                border=ft.Border.all(1, LINE)),
+            surface(form_column([
+                title('Acerca del software', 19),
+                ft.Text('Prepara e imprime etiquetas en ZPL y TSPL, consulta el historial y reimprime por folio.', size=14),
+                ft.Divider(height=12, color=LINE),
+                title('Notas de versión', 16),
+                ft.Text(f'{VERSION} · Nuevo diseño de Acerca de, Guía rápida y Problemas comunes.', size=14),
+            ], spacing=8)),
+        ], spacing=12)
+        tab_content = ft.Column([
+            ft.TabBar(tabs=[ft.Tab(label=label) for label in ('Guía rápida', 'Problemas comunes', 'Soporte', 'Acerca de')]),
+            ft.TabBarView(expand=True, controls=[
+                ft.Column([body], scroll=ft.ScrollMode.AUTO, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+                for body in (guide, problems, support, about)
+            ]),
+        ], expand=True)
+        tabs = ft.Tabs(content=tab_content, length=4, expand=True)
+        self.content.controls = [
+            title('Ayuda', 30),
+            ft.Row([
+                action('Ver guía rápida', lambda _: self.page.run_task(tabs.move_to, 0), ft.Icons.MENU_BOOK, primary=True),
+                action('Guardar manual en PDF', save_manual, ft.Icons.DOWNLOAD_OUTLINED),
+                action('Contactar soporte', lambda _: self.page.run_task(tabs.move_to, 2), ft.Icons.SUPPORT_AGENT),
+            ], wrap=True),
+            tabs,
+        ]
+
+    def history(self):
+        offset = 0
+        active_qr = None
+        search = ft.TextField(hint_text='Busca por folio, fecha o producto', expand=True,
+                              prefix_icon=ft.Icons.SEARCH, **compact_field_style())
+        mode = compact_select(value='all', options=[
+            ft.DropdownOption(key=value, text=name) for value, name in (
+                ('all', 'Todos'), ('folio', 'Folio'), ('date', 'Fecha de impresión'), ('product', 'Producto'),
+            )
+        ])
+        mode.width = 185
+        mode.label = 'Filtros'
+        search.height = mode.height = 48
+        rows = ft.Column(expand=True, spacing=0, scroll=ft.ScrollMode.AUTO)
+        status = ft.Text(size=13, color=MUTED)
+        next_page = icon_action(ft.Icons.CHEVRON_RIGHT, 'Página siguiente', lambda _: paginate(PAGE_SIZE))
+        previous = icon_action(ft.Icons.CHEVRON_LEFT, 'Página anterior', lambda _: paginate(-PAGE_SIZE))
+
+        def table_row(values, *, header=False):
+            widths = (100, None, 145, 65, 125, 130)
+            cells = [grid_cell(value, width=width, expand=1 if width is None else None,
+                               padding=7, edge=index < len(widths) - 1)
+                     for index, (value, width) in enumerate(zip(values, widths))]
+            return grid_row(cells, header=header)
+
+        def draw():
+            mode_value = 'qr' if active_qr is not None else mode.value
+            query = active_qr if active_qr is not None else (search.value or '')
+            found = self.store.print_history(query, mode=mode_value, offset=offset, limit=PAGE_SIZE + 1)
+            states = {'sent': 'Enviado', 'pending': 'Sin confirmar', 'uncertain': 'Envío incierto'}
+            rows.controls = [
+                table_row([
+                    ft.Text(entry.folio, font_family='Consolas', weight=ft.FontWeight.W_700,
+                            max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, tooltip=entry.folio),
+                    truncated(entry.product),
+                    truncated(datetime.fromisoformat(entry.printed_at).strftime('%d/%m/%Y %H:%M')),
+                    ft.Text(str(entry.copies), size=13),
+                    truncated(states[entry.status] + (' · Reimpresión' if entry.reprint else '')),
+                    action('Reimprimir', lambda _, entry=entry: self.reprint(entry, draw),
+                           ft.Icons.PRINT_OUTLINED, height=34),
+                ]) for entry in found[:PAGE_SIZE]
+            ] or [ft.Container(ft.Text('No se encontraron etiquetas.', color=MUTED), padding=18)]
+            previous.disabled = offset == 0
+            next_page.disabled = len(found) <= PAGE_SIZE
+            status.value = f'Página {offset // PAGE_SIZE + 1}' + (' · Coincidencias del QR' if active_qr else '')
+            self.page.update()
+
+        def paginate(step):
+            nonlocal offset
+            offset = max(0, offset + step)
+            draw()
+
+        def search_changed(_):
+            nonlocal offset, active_qr
+            offset, active_qr = 0, None
+            draw()
+
+        def scan(_):
+            fields = [ft.TextField(label=name, autofocus=index == 0, **FIELD_STYLE)
+                      for index, name in enumerate(('Producto', 'Fecha de entrada', 'Descripción',
+                                                    'No. Pedimento', 'Piezas'))]
+
+            def find(_):
+                nonlocal offset, active_qr
+                values = [(field.value or '').strip() for field in fields]
+                if not all(values[index] for index in (0, 1, 2, 4)):
+                    error.value = 'Escanea el QR completo o captura los cinco campos. El pedimento puede quedar vacío.'
+                    self.page.update()
+                    return
+                active_qr = '\t'.join(values)
+                offset = 0
+                search.value = ''
+                self.close()
+                draw()
+
+            fields[-1].on_submit = find
+            error = ft.Text(color=DANGER, size=13)
+            self.dialog('Buscar por QR', ft.Container(form_column([
+                ft.Text('Coloca el cursor en Producto, escanea la etiqueta y pulsa Buscar. '
+                        'Si hay etiquetas con los mismos datos, elige el folio correcto.', color=MUTED),
+                *fields, error,
+            ]), width=460), [
+                action('Cancelar', lambda _: self.close()),
+                action('Buscar', find, ft.Icons.SEARCH, primary=True),
+            ], max_height=540)
+
+        search.on_change = mode.on_select = search_changed
+        self.content.controls = [
+            title('Historial de impresión', 30),
+            ft.Row([search, mode, action('Leer QR', scan, ft.Icons.QR_CODE_SCANNER, height=48),
+                    icon_action(ft.Icons.REFRESH, 'Actualizar historial', lambda _: draw())],
+                   spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            grid_frame(ft.Column([
+                table_row([title(name, 13) for name in ('Folio', 'Producto', 'Fecha de impresión',
+                                                        'Copias', 'Estado', 'Acciones')], header=True),
+                rows,
+            ], expand=True, spacing=0), expand=True),
+            ft.Row([status, ft.Row([previous, next_page], spacing=4)],
+                   alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        ]
+        draw()
+
+    async def spool_job(self, printer, job, payload, notice):
+        try:
+            windows_job = await asyncio.to_thread(submit, printer, payload)
+        except Exception as exc:
+            await asyncio.to_thread(self.store.finish_print, job)
+            self.notice(f'{notice}. Revisa la cola antes de reimprimir. {exc}',
+                        kind='warning', heading='Envío sin confirmar')
+        else:
+            await asyncio.to_thread(self.store.finish_print, job, windows_job)
+            self.notice(f'{notice} · Trabajo de Windows {windows_job}.', heading='Trabajo enviado')
+
+    def reprint(self, entry, refresh):
+        if self.busy:
+            return
+        printer = form_select('Impresora')
+        status = ft.Text('Buscando impresoras…', size=13, color=MUTED)
+
+        async def send_again(_):
+            if self.busy or send.disabled:
+                return
+            self.busy = True
+            selected = printer.value
+            self.close()
+            try:
+                available = await asyncio.to_thread(list_printers)
+                if selected not in {item['pPrinterName'] for item in available}:
+                    raise ValueError('La impresora elegida ya no está disponible.')
+                job, payload = await asyncio.to_thread(self.store.prepare_reprint, entry.id, selected)
+                await self.spool_job(selected, job, payload, f'Folio {entry.folio}')
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.notice(str(exc), kind='error', heading='No se pudo reimprimir')
+            finally:
+                self.busy = False
+                if self.active_tab == 'Historial':
+                    refresh()
+
+        send = action('Reimprimir una copia', send_again, ft.Icons.PRINT_OUTLINED, primary=True, disabled=True)
+        dialog = self.dialog('Reimprimir etiqueta', ft.Container(form_column([
+            ft.Container(form_column([
+                title(f'Folio {entry.folio}', 17),
+                ft.Text(f'Producto: {entry.product} ({entry.sku})'),
+                ft.Text(f'No. Pedimento: {entry.pedimento or "Sin pedimento registrado"}'),
+            ], spacing=5), bgcolor=SOFT, padding=12, border_radius=8),
+            ft.Text('Se enviará una copia con los datos y el folio originales.', color=MUTED),
+            printer, status,
+        ]), width=470), [action('Cancelar', lambda _: self.close()), send])
+
+        async def options():
+            try:
+                await self.load_printers()
+                if not dialog.open:
+                    return
+                choices = self.windows_printers
+                saved = self.store.setting('printer')
+                printer.options = self.printer_options()
+                printer.value = next((name for name in (entry.printer, saved, self.windows_default)
+                                      if name in choices), choices[0] if choices else None)
+                status.value = '' if choices else 'No hay impresoras disponibles.'
+                send.disabled = not printer.value
+            except Exception:
+                status.value = 'No se pudieron consultar las impresoras de Windows.'
+            if dialog.open:
+                self.page.update()
+
+        self.page.run_task(options)
+
     def prepare(self, items):
         if self.busy or not items:
             return
         records = {record[0]: record for record in self.store.designs()}
-        saved_printer = self.store.setting('printer')
-        printer = form_select('Impresora', value=saved_printer or self.windows_default,
-                              options=self.printer_options(saved_printer))
-        default = self.store.setting('design', 'Etiqueta base ZPL')
-        design = form_select('Diseño', options=[option(name) for name in records],
-                             value=default if default in records else next(iter(records), None))
-        copies = ft.TextField(label='Copias para todos', width=135, value='1',
-                              keyboard_type=ft.KeyboardType.NUMBER, **FIELD_STYLE)
+        selected = self.store.setting('printer')
+        layout = records.get(self.store.setting('design'))
+        copies = ft.TextField(tooltip='Copias para todos', expand=True, value='1',
+                              keyboard_type=ft.KeyboardType.NUMBER, **compact_field_style())
         quantities = [ft.TextField(value='1', width=64, height=40, dense=True,
                                    tooltip=f'Copias de {item.sku}', keyboard_type=ft.KeyboardType.NUMBER)
                       for item in items]
+        common_pedimento = ft.TextField(tooltip='No. Pedimento para todo el lote', expand=True, **compact_field_style())
+        pedimentos = [
+            ft.TextField(value='', height=40, dense=True, tooltip=f'No. Pedimento de {item.sku}')
+            for item in items
+        ]
         preview = ft.Container()
         active_preview = 0
         preview_key = None
         preview_revision = 0
         preview_lock = asyncio.Lock()
-        summary = ft.Text(color=INK, weight=ft.FontWeight.W_600)
-        printer_message = ft.Text('Consultando las impresoras de Windows…', color=MUTED, size=13)
+        summary = ft.Text(color=INK, weight=ft.FontWeight.W_600, expand=True)
+        design_name = f'{layout[0]} ({layout[1]})' if layout else 'Sin diseño'
+        configuration = ft.Container(
+            ft.Row([ft.Icon(ft.Icons.PRINT_OUTLINED, size=19),
+                    ft.Text(f'{selected or "Sin impresora"} · {design_name}',
+                            expand=True, weight=ft.FontWeight.W_600)], spacing=9),
+            bgcolor=SOFT, border_radius=7, padding=12,
+        )
+        printer_message = ft.Text('Verificando impresora configurada…', color=MUTED, size=13)
         ready = False
 
         def quantity(value):
             raw = (value or '').strip()
             return int(raw) if raw.isascii() and raw.isdecimal() and len(raw) <= 3 else 0
 
-        def draw_preview(first, counts, *, retry=False):
+        def print_item(index):
+            item = items[index]
+            return replace(item, attributes={**item.attributes, 'pedimento': (pedimentos[index].value or '').strip()})
+
+        def draw_preview(first, *, retry=False):
             nonlocal preview_key, preview_revision
-            if not design.value:
+            if layout is None:
                 preview_key = None
-                preview.content = ft.Text('Selecciona un diseño para revisar la etiqueta.', color=MUTED)
+                preview.content = message_strip('Guarda el diseño predeterminado en Configuración.', 'warning')
                 return
-            item = items[active_preview]
-            folio = first + sum(counts[:active_preview])
-            _, language, source = records[design.value]
+            item = print_item(active_preview)
+            folio = first + active_preview
+            design_name, language, source = layout
             values = {**item_values(item), 'folio': str(folio)}
-            labels = {**BUILTIN_FIELDS, **self.fields}
+            labels = {**BUILTIN_FIELDS, **LABEL_FIELDS, **self.fields}
             heading = title(f'Vista de datos · {item.sku}', 14)
             if language != 'ZPL':
                 preview_key = None
@@ -1066,7 +1387,7 @@ class LabelApp:
                 ], spacing=6)
                 return
 
-            requested = (design.value, item.sku, folio)
+            requested = (design_name, item.sku, folio, item.attributes['pedimento'])
             if requested == preview_key and not retry:
                 return
             preview_key = requested
@@ -1097,7 +1418,7 @@ class LabelApp:
                 return dialog.open and preview_revision == revision and preview_key == requested
 
             def try_again(_):
-                draw_preview(self.store.next_folio(), [quantity(entry.value) for entry in quantities], retry=True)
+                draw_preview(self.store.next_folio(), retry=True)
                 self.page.update()
 
             async def load_preview():
@@ -1131,10 +1452,12 @@ class LabelApp:
             count = sum(counts)
             first = self.store.next_folio()
             valid_count = all(counts) and count <= LIMIT
-            summary.value = (f'{count} etiquetas · Folios estimados: {first} a {first + count - 1}'
-                             if valid_count else f'Indica al menos una copia por producto y hasta {LIMIT} etiquetas en total.')
-            send.disabled = not (ready and valid_count and printer.value in self.windows_printers and design.value) or self.busy
-            draw_preview(first, counts)
+            products_text = '1 producto' if len(items) == 1 else f'{len(items)} productos'
+            labels_text = '1 etiqueta' if count == 1 else f'{count} etiquetas'
+            summary.value = (f'{products_text} · {labels_text}' if valid_count
+                             else f'Indica de 1 a {LIMIT} etiquetas en total.')
+            send.disabled = not (ready and valid_count and layout is not None) or self.busy
+            draw_preview(first)
             self.page.update()
 
         def show_item(index):
@@ -1149,51 +1472,45 @@ class LabelApp:
                 field.value = copies.value
             update_summary()
 
+        def apply_pedimento(_):
+            for field in pedimentos:
+                field.value = common_pedimento.value
+            update_summary()
+
         async def load_options():
             nonlocal ready
+            if not selected:
+                printer_message.value = 'Guarda una impresora en Configuración para poder imprimir.'
+                self.page.update()
+                return
             try:
-                await self.load_printers()
+                available = await asyncio.to_thread(list_printers)
             except Exception:
                 if dialog.open:
-                    printer_message.value = 'No se pudieron cargar las impresoras. Revisa la configuración de Windows.'
+                    printer_message.value = 'No se pudieron consultar las impresoras. Revísalas en Configuración.'
                     self.page.update()
                 return
             if not dialog.open:
                 return
-            selected = printer.value or self.windows_default
-            printer.options = self.printer_options(selected)
-            printer.value = selected
-            printer_message.value = ('La impresora guardada no está disponible. Selecciona otra.'
-                                     if selected and selected not in self.windows_printers
-                                     else 'Selecciona una impresora.' if not selected else '')
-            if not self.windows_printers:
-                printer_message.value = 'Windows no devolvió impresoras instaladas.'
-            printer_message.visible = bool(printer_message.value)
-            ready = True
+            ready = selected in {item['pPrinterName'] for item in available}
+            printer_message.value = '' if ready else 'La impresora guardada no está disponible. Revísala en Configuración.'
+            printer_message.visible = not ready
             update_summary()
 
         async def send_labels(_):
             if self.busy or send.disabled:
                 return
-            selected = printer.value
-            layout = records[design.value]
-            entries = [(item, quantity(field.value)) for item, field in zip(items, quantities)]
+            entries = [(print_item(index), quantity(field.value)) for index, field in enumerate(quantities)]
             self.busy = True
             self.close()
             try:
                 available = await asyncio.to_thread(list_printers)
                 if selected not in {item['pPrinterName'] for item in available}:
                     raise ValueError('La cola ya no está instalada. Selecciona otra en Configuración.')
-                first, last, payload = await asyncio.to_thread(
-                    self.store.prepare_print_batch, entries, layout,
+                first, last, payload, job = await asyncio.to_thread(
+                    self.store.prepare_print_batch, entries, layout, printer=selected,
                 )
-                try:
-                    job_id = await asyncio.to_thread(submit, selected, payload)
-                except Exception as exc:
-                    self.notice(f'Folios {first}–{last}. Revisa la cola antes de reimprimir. {exc}',
-                                kind='warning', heading='Envío sin confirmar')
-                else:
-                    self.notice(f'Folios {first}–{last} · Trabajo de Windows {job_id}.', heading='Trabajo enviado')
+                await self.spool_job(selected, job, payload, f'Folios {first}-{last}')
             except Exception as exc:
                 self.notice(str(exc), kind='error', heading='No se pudo preparar la impresión')
             finally:
@@ -1202,7 +1519,7 @@ class LabelApp:
         async def print_labels(event):
             if self.busy or send.disabled:
                 return
-            missing = missing_fields(records[design.value][2], items)
+            missing = missing_fields(layout[2], (print_item(index) for index in range(len(items))))
             if not missing:
                 await send_labels(event)
                 return
@@ -1232,62 +1549,119 @@ class LabelApp:
                               'Esos campos se imprimirán vacíos.', 'warning'),
                 *details,
             ]), width=480), [
-                ft.TextButton(content='Volver', on_click=lambda _: self.close()),
+                action('Volver', lambda _: self.close()),
                 action('Imprimir de todos modos', confirm, primary=True),
             ], max_height=520)
 
-        send = action('Enviar a imprimir', print_labels, ft.Icons.PRINT_OUTLINED, primary=True, disabled=True)
-        for entry in quantities:
+        send = action('Imprimir', print_labels, ft.Icons.PRINT_OUTLINED,
+                      primary=True, disabled=True, height=46, width=148)
+        for entry in [*quantities, *pedimentos]:
             entry.on_change = update_summary
-        design.on_select = update_summary
 
-        def select_printer(_):
-            printer_message.visible = printer.value not in self.windows_printers
-            update_summary()
-
-        printer.on_select = select_printer
-        def batch_row(sku, product, copy, view, background):
-            return ft.Container(ft.Row([
-                ft.Container(sku, expand=2),
-                ft.Container(product, expand=4),
-                ft.Container(copy, width=72),
-                ft.Container(view, width=36),
-            ], spacing=10), bgcolor=background, padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-                border=ft.Border.only(bottom=ft.BorderSide(1, LINE)))
+        def batch_row(product, copy, pedimento, view, *, header=False, selected=False):
+            return grid_row([
+                grid_cell(product, expand=4), grid_cell(copy, width=96, padding=8),
+                grid_cell(pedimento, expand=3), grid_cell(view, width=48, padding=5, edge=False),
+            ], header=header, selected=selected)
 
         batch_rows = [
-            batch_row(truncated(item.sku), truncated(item.name), entry,
-                      icon_action(ft.Icons.VISIBILITY_OUTLINED, f'Ver etiqueta de {item.sku}',
-                                  lambda _, index=index: show_item(index)),
-                      SELECTED if index == active_preview else PAPER)
-            for index, (item, entry) in enumerate(zip(items, quantities))
+            batch_row(
+                truncated(' · '.join(filter(None, (item.name, item.sku, label_values(item).get('medidas'))))),
+                entry, pedimentos[index],
+                icon_action(ft.Icons.VISIBILITY_OUTLINED, f'Ver etiqueta de {item.sku}',
+                            lambda _, index=index: show_item(index)),
+                selected=index == active_preview,
+            ) for index, (item, entry) in enumerate(zip(items, quantities))
         ]
-        batch = ft.Container(ft.ListView(controls=batch_rows, spacing=0),
-                             height=min(192, len(batch_rows) * 49))
-        printer.expand = design.expand = True
+        batch = grid_frame(form_column([
+            batch_row(title('Producto', 13), title('Copias', 13), title('No. Pedimento', 13),
+                      ft.Text(''), header=True),
+            ft.Container(ft.ListView(controls=batch_rows, spacing=0),
+                         height=min(172, len(batch_rows) * 43)),
+        ], spacing=0))
+        footer = ft.Row([
+            summary, action('Cancelar', lambda _: self.close(), height=46, width=148), send,
+        ], width=min(760, max(340, (self.page.width or 880) - 120)),
+           spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         dialog = self.dialog('Preparar impresión', ft.Container(form_column([
-            title(items[0].name if len(items) == 1 else f'{len(items)} productos seleccionados', 16),
-            ft.Row([printer, design], spacing=12),
+            configuration,
             printer_message,
-            ft.Text('Guarda un diseño para poder imprimir.', color=NOTICES['warning'][2], visible=not records),
-            surface(form_column([
-                title('Productos y copias', 14),
-                ft.Row([
-                    ft.Row([copies, action('Aplicar a todos', apply_copies, height=FIELD_HEIGHT)],
-                           visible=len(items) > 1),
-                    ft.Container(summary, expand=True, padding=8, bgcolor=WORKSPACE, border_radius=6),
-                ], spacing=12),
-                batch_row(title('SKU', 13), title('Producto', 13), title('Copias', 13), ft.Text(''), SOFT),
-                batch,
-            ], spacing=6), padding=12),
+            ft.Row([ft.Text('Copias para todos', width=175), copies,
+                    action('Aplicar a todos', apply_copies, height=COMPACT_HEIGHT, width=175)],
+                   spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([ft.Text('Pedimento para el lote', width=175), common_pedimento,
+                    action('Aplicar pedimento', apply_pedimento, height=COMPACT_HEIGHT, width=175)],
+                   spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            batch,
             surface(preview, padding=12),
-        ], spacing=10), width=760), [ft.TextButton(content='Cancelar', on_click=lambda _: self.close()), send],
-            max_height=700)
+        ], spacing=10), width=760), [footer], max_height=800, footer_gap=12)
         update_summary()
         self.page.run_task(load_options)
 
 
-def main(page: ft.Page):
-    # Preserve the Windows data directory used by the previous desktop client.
+def startup_panel(*, retry=None):
+    if retry is None:
+        indicator = ft.Container(
+            ft.Stack([
+                ft.ProgressRing(width=76, height=76, stroke_width=3, color=ACCENT, bgcolor=SOFT,
+                                semantics_label='Cargando catálogo'),
+                ft.Container(ft.Icon(ft.Icons.LAYERS_OUTLINED, size=29, color=ACCENT),
+                             width=54, height=54, border_radius=16, bgcolor=SELECTED,
+                             alignment=ft.Alignment.CENTER),
+            ], width=76, height=76, alignment=ft.Alignment.CENTER),
+            alignment=ft.Alignment.CENTER,
+        )
+        status = [ft.Text('Abriendo el catálogo…', color=MUTED, size=14, text_align=ft.TextAlign.CENTER)]
+    else:
+        indicator = ft.Icon(ft.Icons.ERROR_OUTLINE, color=DANGER, size=38)
+        status = [
+            ft.Text('No se pudo abrir la base de datos local.', color=MUTED, size=14,
+                    text_align=ft.TextAlign.CENTER),
+            action('Reintentar', retry, ft.Icons.REFRESH, primary=True),
+        ]
+    return ft.Container(
+        ft.Container(
+            ft.Column([indicator, ft.Text(APP_NAME, size=24, weight=ft.FontWeight.W_700, color=INK,
+                                         text_align=ft.TextAlign.CENTER), *status], tight=True, spacing=12,
+                      horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            width=380, bgcolor=PAPER, border_radius=22, border=ft.Border.all(1, LINE),
+            padding=ft.Padding.symmetric(horizontal=28, vertical=32),
+            shadow=ft.BoxShadow(blur_radius=28, color='#18344F69', offset=ft.Offset(0, 10)),
+        ),
+        expand=True, alignment=ft.Alignment.CENTER, bgcolor=WORKSPACE,
+    )
+
+
+async def main(page: ft.Page):
+    page.title = APP_NAME
+    page.theme = ft.Theme(font_family='Segoe UI', color_scheme_seed=ACCENT)
+    page.theme_mode = ft.ThemeMode.LIGHT
+    page.padding = 0
+    page.window.min_width = 880
+    page.window.min_height = 620
+    page.window.width = 1200
+    page.window.height = 760
     data = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
-    LabelApp(page, LabelStore(data / 'Occidental Maderas' / 'etiquetas.sqlite3'))
+
+    def open_catalog():
+        store = LabelStore(data / 'Occidental Maderas' / 'etiquetas.sqlite3')
+        return store, store.products()
+
+    async def load(_=None):
+        page.controls[:] = [startup_panel()]
+        page.update()
+        started = asyncio.get_running_loop().time()
+        try:
+            store, products = await asyncio.to_thread(open_catalog)
+        except (OSError, sqlite3.Error, ValueError):
+            page.controls[:] = [startup_panel(retry=load)]
+            page.update()
+            return
+        # Keep fast loads visible briefly to avoid a single-frame flash.
+        remaining = 0.55 - (asyncio.get_running_loop().time() - started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        page.controls.clear()
+        LabelApp(page, store, products)
+
+    await load()

@@ -9,7 +9,7 @@ import re
 import sqlite3
 import unicodedata
 
-from occidental.occma import DESIGN_NAME, FIELDS as OCCMA_FIELDS, ZPL as OCCMA_ZPL
+from occidental.occma import DESIGN_NAME, FIELDS as OCCMA_FIELDS, PREVIOUS_ZPLS, ZPL as OCCMA_ZPL
 
 @dataclass(frozen=True)
 class Item:
@@ -23,6 +23,25 @@ class Item:
 class CatalogImport:
     items: list[Item]
     fields: dict[str, str]
+
+
+@dataclass(frozen=True)
+class PrintHistoryEntry:
+    id: int
+    folio: str
+    printed_at: str
+    product: str
+    sku: str
+    copies: int
+    printer: str
+    status: str
+    reprint: bool
+    qr: str = ''
+
+    @property
+    def pedimento(self):
+        fields = (self.qr or '').split('\t')
+        return fields[3] if len(fields) == 5 else ''
 
 
 DEFAULT_ZPL = """^XA
@@ -40,6 +59,7 @@ BUILTIN_FIELDS = {'sku': 'SKU', 'nombre': 'Nombre', 'descripcion': 'Descripción
 LABEL_FIELDS = {'clase': 'Clase', 'medidas': 'Medidas', 'piezas_texto': 'Piezas con unidad',
                 'pedimento': 'No. Pedimento', 'fecha_entrada': 'Fecha de entrada automática',
                 'qr_occma': 'QR de Occidental Maderas'}
+PEDIMENTO_COLUMNS = {'pedimento', 'no_pedimento', 'numero_de_pedimento', 'no_de_pedimento'}
 
 
 def key(value):
@@ -89,7 +109,7 @@ def parse_rows(rows):
                headers.index('descripcion') if 'descripcion' in headers else None)
     fields = {}
     for index, (header, label) in enumerate(zip(headers, labels)):
-        if index in indices or not label:
+        if index in indices or not label or header in PEDIMENTO_COLUMNS:
             continue
         if not header or header in BUILTIN_FIELDS or header in fields:
             raise ValueError(f'El encabezado «{label}» genera una variable inválida, reservada o repetida.')
@@ -121,13 +141,13 @@ def parse_rows(rows):
 
 
 def parse_occma_rows(headers, labels, rows):
-    headers = ['pedimento' if header in {'no_pedimento', 'numero_de_pedimento', 'no_de_pedimento'}
-               else 'sku' if header == 'codigo' else header for header in headers]
+    headers = ['' if header in PEDIMENTO_COLUMNS else 'sku' if header == 'codigo' else header
+               for header in headers]
     named = [header for header in headers if header]
     if len(named) != len(set(named)):
         raise ValueError('El catálogo contiene encabezados repetidos.')
-    fields = {**OCCMA_FIELDS, 'pedimento': 'No. Pedimento'}
-    taken = {'clase', 'sku', 'pedimento', *OCCMA_FIELDS}
+    fields = dict(OCCMA_FIELDS)
+    taken = {'clase', 'sku', *OCCMA_FIELDS}
     for header, label in zip(headers, labels):
         if header and header not in taken:
             if header in BUILTIN_FIELDS or header in LABEL_FIELDS:
@@ -152,8 +172,7 @@ def parse_occma_rows(headers, labels, rows):
     result = parse_rows(converted())
     renames = {re.sub(r'[^a-z0-9]+', '_', key(label)).strip('_'): name for name, label in fields.items()}
     return CatalogImport([Item(item.sku, item.name, item.description,
-                               {renames[name]: value for name, value in item.attributes.items()
-                                if renames[name] != 'pedimento' or 'pedimento' in headers})
+                               {renames[name]: value for name, value in item.attributes.items()})
                           for item in result.items], fields)
 
 
@@ -228,15 +247,21 @@ def validate_design(source, language, extra_fields=()):
         raise ValueError('Lenguaje de impresión no admitido.')
 
 
+def occma_qr(values):
+    fields = ('medidas', 'fecha_entrada', 'clase', 'pedimento', 'piezas')
+    return '\t'.join(' '.join(values.get(field, '').split()) for field in fields)
+
+
 def render(source, language, item, folio, *, timestamp=None):
     date = timestamp or datetime.now().astimezone()
     values = {**label_values(item), 'folio': str(folio),
-              'fecha_entrada': date.strftime('%d/%m/%Y %H:%M:%S')}
+              'fecha_entrada': date.strftime('%d/%m/%Y')}
     if 'qr_occma' in design_fields(source):
-        payload = {name: values.get(name, '') for name in (
-            'sku', 'clase', 'espesor', 'ancho', 'largo', 'medidas', 'piezas', 'pedimento')}
-        payload.update(v=1, folio=folio, fecha_entrada=date.isoformat(timespec='seconds'))
-        values['qr_occma'] = json.dumps(payload, ensure_ascii=True, separators=(',', ':'))
+        # Only the four delimiters may emit navigation keystrokes.
+        values['qr_occma'] = occma_qr(values)
+        if source == OCCMA_ZPL and len(values['qr_occma'].encode('utf-8')) > 84:
+            # A byte-mode M QR above 84 bytes needs more than 37 modules per side.
+            source = source.replace('^BQN,2,9', '^BQN,2,7', 1)
 
     def replace(match):
         field = match.group(1)
@@ -262,6 +287,19 @@ class LabelStore:
             db.execute('CREATE TABLE IF NOT EXISTS catalog_fields (key TEXT PRIMARY KEY, label TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS designs (name TEXT PRIMARY KEY, language TEXT NOT NULL, source TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            db.execute('''CREATE TABLE IF NOT EXISTS print_jobs (
+                id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, printer TEXT NOT NULL,
+                status TEXT NOT NULL, windows_job TEXT, reprint INTEGER NOT NULL DEFAULT 0
+            )''')
+            db.execute('''CREATE TABLE IF NOT EXISTS print_labels (
+                id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES print_jobs(id),
+                folio TEXT NOT NULL, sku TEXT NOT NULL, product TEXT NOT NULL, copies INTEGER NOT NULL,
+                qr TEXT, payload BLOB NOT NULL
+            )''')
+            db.execute('CREATE INDEX IF NOT EXISTS print_labels_folio ON print_labels(folio)')
+            db.execute('CREATE INDEX IF NOT EXISTS print_labels_qr ON print_labels(qr)')
+            db.executemany("UPDATE designs SET source=? WHERE name=? AND language='ZPL' AND source=?",
+                           ((OCCMA_ZPL, DESIGN_NAME, prior) for prior in PREVIOUS_ZPLS))
             db.execute("INSERT OR IGNORE INTO settings VALUES ('next_folio', '1')")
             seeded = db.execute("SELECT 1 FROM settings WHERE key='designs_initialized'").fetchone()
             if not seeded:
@@ -278,7 +316,8 @@ class LabelStore:
 
     def catalog_fields(self):
         with closing(self.connect()) as db:
-            return dict(db.execute('SELECT key, label FROM catalog_fields ORDER BY rowid'))
+            return {name: label for name, label in db.execute('SELECT key, label FROM catalog_fields ORDER BY rowid')
+                    if name not in PEDIMENTO_COLUMNS}
 
     def import_products(self, items, *, replace=False, fields=None, expected=None):
         if not items:
@@ -394,7 +433,7 @@ class LabelStore:
     def prepare_print(self, items, copies, design):
         return self.prepare_print_batch([(item, copies) for item in items], design)
 
-    def prepare_print_batch(self, entries, design):
+    def prepare_print_batch(self, entries, design, *, printer=None):
         if any(type(copies) is not int or copies < 1 for _, copies in entries):
             raise ValueError('Cada producto debe tener al menos una copia.')
         if not 1 <= sum(copies for _, copies in entries) <= LIMIT:
@@ -407,15 +446,78 @@ class LabelStore:
             timestamp = datetime.now().astimezone()
             payload = bytearray()
             folio = start
+            job = None if printer is None else db.execute(
+                "INSERT INTO print_jobs(created_at, printer, status) VALUES (?, ?, 'pending')",
+                (timestamp.isoformat(timespec='seconds'), printer),
+            ).lastrowid
+            with_qr = 'qr_occma' in design_fields(source)
             for item, copies in entries:
-                for _ in range(copies):
-                    payload.extend(render(source, language, item, folio, timestamp=timestamp))
-                    if len(payload) > 8 * 1024 * 1024:
-                        raise ValueError('El trabajo supera 8 MB. Reduce el tamaño del lote.')
-                    folio += 1
+                label = render(source, language, item, folio, timestamp=timestamp)
+                if len(payload) + len(label) * copies > 8 * 1024 * 1024:
+                    raise ValueError('El trabajo supera 8 MB. Reduce el tamaño del lote.')
+                payload.extend(label * copies)
+                if job is not None:
+                    values = label_values(item)
+                    values['fecha_entrada'] = timestamp.strftime('%d/%m/%Y')
+                    product = ' · '.join(filter(None, (item.name, values.get('medidas'))))
+                    db.execute('''INSERT INTO print_labels(job_id, folio, sku, product, copies, qr, payload)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                               (job, str(folio), item.sku, product, copies,
+                                occma_qr(values) if with_qr else None, label))
+                folio += 1
             # Commit before spooling so an uncertain print can never reuse these folios.
             db.execute("UPDATE settings SET value=? WHERE key='next_folio'", (str(folio),))
-            return start, folio - 1, bytes(payload)
+            batch = (start, folio - 1, bytes(payload))
+            return batch if job is None else (*batch, job)
+
+    def finish_print(self, job, windows_job=None):
+        status = 'uncertain' if windows_job is None else 'sent'
+        with closing(self.connect()) as db, db:
+            db.execute('UPDATE print_jobs SET status=?, windows_job=? WHERE id=?',
+                       (status, windows_job, job))
+
+    def print_history(self, query='', *, mode='all', offset=0, limit=40):
+        query = query.strip() if mode != 'qr' else query
+        date_query = query
+        if mode in {'all', 'date'} and '/' in query:
+            try:
+                date_query = datetime.strptime(query, '%d/%m/%Y').date().isoformat()
+            except ValueError:
+                pass
+        with closing(self.connect()) as db:
+            db.create_function('search_key', 1, key, deterministic=True)
+            term = key(query)
+            # instr treats the operator input as literal text.
+            clauses = {
+                'all': '(l.folio = ? OR instr(search_key(l.product || \' \' || l.sku), ?) > 0 OR instr(j.created_at, ?) = 1)',
+                'folio': 'l.folio = ?',
+                'date': 'instr(j.created_at, ?) = 1',
+                'product': "instr(search_key(l.product || ' ' || l.sku), ?) > 0",
+                'qr': 'l.qr = ?',
+            }
+            arguments = {'all': (query, term, date_query), 'date': (date_query,), 'product': (term,)}
+            where = clauses[mode] if query else '1'
+            params = arguments.get(mode, (query,)) if query else ()
+            rows = db.execute(f'''SELECT l.id, l.folio, j.created_at, l.product, l.sku, l.copies,
+                                         j.printer, j.status, j.reprint, l.qr
+                                  FROM print_labels l JOIN print_jobs j ON j.id=l.job_id
+                                  WHERE {where} ORDER BY l.id DESC LIMIT ? OFFSET ?''',
+                              (*params, limit, offset))
+            return [PrintHistoryEntry(*row) for row in rows]
+
+    def prepare_reprint(self, label_id, printer):
+        with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            label = db.execute('SELECT folio, sku, product, qr, payload FROM print_labels WHERE id=?',
+                               (label_id,)).fetchone()
+            if label is None:
+                raise ValueError('La etiqueta ya no está en el historial.')
+            folio, sku, product, qr, payload = label
+            job = db.execute("INSERT INTO print_jobs(created_at, printer, status, reprint) VALUES (?, ?, 'pending', 1)",
+                             (datetime.now().astimezone().isoformat(timespec='seconds'), printer)).lastrowid
+            db.execute('''INSERT INTO print_labels(job_id, folio, sku, product, copies, qr, payload)
+                          VALUES (?, ?, ?, ?, 1, ?, ?)''', (job, folio, sku, product, qr, payload))
+            return job, payload
 
     def next_folio(self):
         return int(self.setting('next_folio', '1'))

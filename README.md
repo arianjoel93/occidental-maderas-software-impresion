@@ -24,11 +24,11 @@ Usa **Buscar en** para filtrar una columna, como Factura. **Seleccionar resultad
 2. Importa el Excel o CSV. **Agregar y actualizar** conserva los productos anteriores. **Reemplazar catálogo** conserva únicamente los SKU del archivo. La vista previa muestra los SKU nuevos, los valores que cambian y los que se retirarán según el modo elegido.
 3. En **Diseños**, consulta la tabla, carga un archivo ZPL o TSPL con **Nuevo diseño**, o usa **Ver**, **Editar** y **Borrar**.
 4. En **Configuración**, las colas de Windows se cargan al entrar. Se preselecciona la impresora guardada o la predeterminada de Windows cuando aún no hay una guardada. Usa el icono de actualización junto al puerto si acabas de conectar otra impresora. Puedes cambiar el diseño predeterminado y el siguiente folio, incluso para volver a un número menor.
-5. En **Preparar impresión**, ajusta las copias por producto y revisa los folios estimados. El icono de vista previa cambia el producto que se muestra. Los diseños ZPL envían una sola etiqueta a Labelary para generar el PNG con los datos del producto y un folio estimado, sin reservarlo. La vista usa 8 puntos por mm (aproximadamente 203 dpi) y toma las dimensiones de `^PW` y `^LL` cuando están presentes. Si falta alguna medida, se usa 4 pulgadas de ancho o 6 de alto, respectivamente. Los diseños TSPL muestran los valores sin consultar Labelary. Si la vista previa falla, todavía puedes imprimir.
+5. En **Preparar impresión**, usa la sección **Aplicar al lote** para asignar pedimento y copias a todas las filas. En **Productos** puedes ajustar cada fila y revisar los folios estimados. La impresora y el diseño se guardan en **Configuración**. El icono de vista previa cambia el producto que se muestra. Los diseños ZPL envían una sola etiqueta a Labelary para generar el PNG con los datos del producto y un folio estimado, sin reservarlo. La vista usa 8 puntos por mm (aproximadamente 203 dpi) y toma las dimensiones de `^PW` y `^LL` cuando están presentes. Si falta alguna medida, se usa 4 pulgadas de ancho o 6 de alto, respectivamente. Los diseños TSPL muestran los valores sin consultar Labelary. Si la vista previa falla, todavía puedes imprimir.
 
 La aplicación reutiliza `%LOCALAPPDATA%\Occidental Maderas\etiquetas.sqlite3`. El reemplazo del catálogo afecta solo a productos. Las plantillas, la impresora configurada y el consecutivo se conservan.
 
-El catálogo de Occidental Maderas admite **Clase, Espesor, Ancho, Largo y Piezas**, con **No. Pedimento** opcional. La primera importación compatible instala el diseño **Occidental Maderas · Etiqueta con QR**. Si ya tienes un diseño predeterminado, puedes cambiarlo en **Configuración**. El repositorio contiene el código y la definición de la etiqueta. El Excel del cliente, los respaldos SQLite y los ejecutables se manejan por separado.
+El catálogo de Occidental Maderas admite **Clase, Espesor, Ancho, Largo y Piezas**. Captura **No. Pedimento** en **Preparar impresión**, para todo el lote o por producto. La primera importación compatible instala el diseño **Occidental Maderas · Etiqueta con QR**. Si ya tienes un diseño predeterminado, puedes cambiarlo en **Configuración**. El repositorio contiene el código y la definición de la etiqueta. El Excel del cliente, los respaldos SQLite y los ejecutables se manejan por separado.
 
 La vista previa indica el ancho y alto de la etiqueta en milímetros. Si el formato supera el espacio del diálogo, la imagen se reduce de manera proporcional. El tamaño físico que muestra el monitor depende de su resolución y escala.
 
@@ -36,9 +36,15 @@ Al detectar columnas nuevas, la importación solicita confirmación antes de inc
 
 ## Empaquetar para Windows
 
+La pestaña **Ayuda** incluye guía rápida, solución de problemas, soporte de Tectronic e información de la versión. El PDF se guarda desde la app sin conexión.
+
 ```powershell
 .\.venv\Scripts\python.exe -m pip install flet-cli==0.85.3
-.\.venv\Scripts\flet.exe pack main.py --name OccidentalMaderas --distpath dist-flet
+.\.venv\Scripts\flet.exe pack main.py --name OccidentalMaderas --distpath dist-flet --add-data "occidental/resources:occidental/resources"
 ```
 
 Consulta las [bases del proyecto](docs/bases-del-proyecto.md) para ver el contrato de los diseños y los folios. Ejecuta `python -m unittest discover -s tests -v` para verificar el núcleo de etiquetas.
+
+## Instalador para Windows
+
+El instalador de Inno Setup se define en `installer/ControlImpresion.iss`. Compílalo con `ISCC.exe installer\ControlImpresion.iss` después de generar `dist-flet\OccidentalMaderas.exe` y preparar `dist-flet\catalogo-inicial.sqlite3` con el catálogo autorizado para la entrega. Usa una base nueva para el catálogo inicial. El instalador copia esa base solo si el perfil aún no tiene una y la conserva al desinstalar.
